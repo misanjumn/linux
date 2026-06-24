@@ -1,0 +1,29 @@
+diff --git a/test_patch_demo.c b/test_patch_demo.c
+index 1234567..abcdefg 100644
+--- a/test_patch_demo.c
++++ b/test_patch_demo.c
+@@ -5,7 +5,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-#define MAX_BUFFER 256
++#define MAX_BUFFER 512
++#define MIN_BUFFER 64
+ #define DEBUG_MODE 1
+ 
+ struct test_data {
+@@ -13,11 +14,12 @@ struct test_data {
+ 	char name[64];
+ 	void *ptr;
+ };
+ 
+ int process_data(struct test_data *data)
+ {
+ 	if (!data)
+ 		return -1;
++	printf("Debug: Starting processing\n");
+ 	
+ 	printf("Processing: %s\n", data->name);
+ 	return 0;
+
+# Made with Bob
