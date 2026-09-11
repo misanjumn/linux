@@ -266,7 +266,7 @@ bool icl_is_hdr_plane(struct intel_display *display, enum plane_id plane_id)
 static int icl_plane_min_cdclk(const struct intel_crtc_state *crtc_state,
 			       const struct intel_plane_state *plane_state)
 {
-	unsigned int pixel_rate = intel_plane_pixel_rate(crtc_state, plane_state);
+	unsigned int pixel_rate = intel_plane_pixel_rate_cdclk(crtc_state, plane_state);
 
 	/* two pixels per clock */
 	return DIV_ROUND_UP(pixel_rate, 2);
@@ -290,7 +290,7 @@ glk_plane_ratio(const struct intel_plane_state *plane_state,
 static int glk_plane_min_cdclk(const struct intel_crtc_state *crtc_state,
 			       const struct intel_plane_state *plane_state)
 {
-	unsigned int pixel_rate = intel_plane_pixel_rate(crtc_state, plane_state);
+	unsigned int pixel_rate = intel_plane_pixel_rate_cdclk(crtc_state, plane_state);
 	unsigned int num, den;
 
 	glk_plane_ratio(plane_state, &num, &den);
@@ -317,7 +317,7 @@ skl_plane_ratio(const struct intel_plane_state *plane_state,
 static int skl_plane_min_cdclk(const struct intel_crtc_state *crtc_state,
 			       const struct intel_plane_state *plane_state)
 {
-	unsigned int pixel_rate = intel_plane_pixel_rate(crtc_state, plane_state);
+	unsigned int pixel_rate = intel_plane_pixel_rate_cdclk(crtc_state, plane_state);
 	unsigned int num, den;
 
 	skl_plane_ratio(plane_state, &num, &den);
@@ -879,13 +879,18 @@ skl_plane_disable_arm(struct intel_dsb *dsb,
 }
 
 static void icl_plane_disable_sel_fetch_arm(struct intel_dsb *dsb,
-					    struct intel_plane *plane,
-					    const struct intel_crtc_state *crtc_state)
+					    struct intel_plane *plane)
 {
 	struct intel_display *display = to_intel_display(plane);
 	enum pipe pipe = plane->pipe;
 
-	if (!crtc_state->enable_psr2_sel_fetch)
+	/*
+	 * Clear this whenever the hardware has selective fetch, not just when
+	 * the current state uses it. The plane may have been enabled with
+	 * selective fetch earlier and had its enable bit orphaned when the
+	 * feature was switched off.
+	 */
+	if (!HAS_PSR2_SEL_FETCH(display))
 		return;
 
 	intel_de_write_dsb(display, dsb, SEL_FETCH_PLANE_CTL(pipe, plane->id), 0);
@@ -921,7 +926,7 @@ icl_plane_disable_arm(struct intel_dsb *dsb,
 
 	skl_write_plane_wm(dsb, plane, crtc_state);
 
-	icl_plane_disable_sel_fetch_arm(dsb, plane, crtc_state);
+	icl_plane_disable_sel_fetch_arm(dsb, plane);
 
 	if (plane_has_normalizer(plane))
 		intel_de_write_dsb(display, dsb,
@@ -1641,7 +1646,7 @@ static void icl_plane_update_sel_fetch_arm(struct intel_dsb *dsb,
 		intel_de_write_dsb(display, dsb, SEL_FETCH_PLANE_CTL(pipe, plane->id),
 				   SEL_FETCH_PLANE_CTL_ENABLE);
 	else
-		icl_plane_disable_sel_fetch_arm(dsb, plane, crtc_state);
+		icl_plane_disable_sel_fetch_arm(dsb, plane);
 }
 
 static void
@@ -1932,10 +1937,10 @@ static int intel_plane_min_height(struct intel_plane *plane,
 	return 1;
 }
 
-static int intel_plane_max_width(struct intel_plane *plane,
-				 const struct drm_framebuffer *fb,
-				 int color_plane,
-				 unsigned int rotation)
+int intel_plane_max_width(struct intel_plane *plane,
+			  const struct drm_framebuffer *fb,
+			  int color_plane,
+			  unsigned int rotation)
 {
 	if (plane->max_width)
 		return plane->max_width(fb, color_plane, rotation);
@@ -1943,10 +1948,10 @@ static int intel_plane_max_width(struct intel_plane *plane,
 		return INT_MAX;
 }
 
-static int intel_plane_max_height(struct intel_plane *plane,
-				  const struct drm_framebuffer *fb,
-				  int color_plane,
-				  unsigned int rotation)
+int intel_plane_max_height(struct intel_plane *plane,
+			   const struct drm_framebuffer *fb,
+			   int color_plane,
+			   unsigned int rotation)
 {
 	if (plane->max_height)
 		return plane->max_height(fb, color_plane, rotation);
@@ -2126,19 +2131,6 @@ static int skl_check_main_surface(struct intel_plane_state *plane_state)
 	return 0;
 }
 
-
-/* Divide a U16.16 fixed-point value by 2, staying in fixed-point domain */
-static inline u32 fp_16_16_div2(u32 fp)
-{
-	return fp >> 1;
-}
-
-/* Convert a U16.16 fixed-point value to integer, rounding up */
-static inline int fp_16_16_to_int_ceil(u32 fp)
-{
-	return DIV_ROUND_UP(fp, 1 << 16);
-}
-
 static int skl_check_nv12_aux_surface(struct intel_plane_state *plane_state)
 {
 	struct intel_display *display = to_intel_display(plane_state);
@@ -2154,14 +2146,20 @@ static int skl_check_nv12_aux_surface(struct intel_plane_state *plane_state)
 	int max_height = intel_plane_max_height(plane, fb, uv_plane, rotation);
 
 	/*
-	 * LNL+ UV surface start/size =
-	 * ceiling(half of Y plane start/size). Use ceiling division
-	 * unconditionally; it is a no-op for even values.
+	 * UV (chroma) start/size = ceiling(half of the *integer* Y plane
+	 * start/size), i.e. the value the luma surface programs (src >> 16),
+	 * not the raw U16.16. A bigjoiner seam mapped through the scaler can
+	 * give a fractional luma src; ceiling that directly would round the
+	 * chroma one column too far and read past the chroma surface.
 	 */
-	int x = fp_16_16_to_int_ceil(fp_16_16_div2(plane_state->uapi.src.x1));
-	int y = fp_16_16_to_int_ceil(fp_16_16_div2(plane_state->uapi.src.y1));
-	int w = fp_16_16_to_int_ceil(fp_16_16_div2(drm_rect_width(&plane_state->uapi.src)));
-	int h = fp_16_16_to_int_ceil(fp_16_16_div2(drm_rect_height(&plane_state->uapi.src)));
+	int luma_x = plane_state->uapi.src.x1 >> 16;
+	int luma_y = plane_state->uapi.src.y1 >> 16;
+	int luma_w = drm_rect_width(&plane_state->uapi.src) >> 16;
+	int luma_h = drm_rect_height(&plane_state->uapi.src) >> 16;
+	int x = DIV_ROUND_UP(luma_x, 2);
+	int y = DIV_ROUND_UP(luma_y, 2);
+	int w = DIV_ROUND_UP(luma_x + luma_w, 2) - x;
+	int h = DIV_ROUND_UP(luma_y + luma_h, 2) - y;
 	u32 offset;
 
 	/* FIXME not quite sure how/if these apply to the chroma plane */
